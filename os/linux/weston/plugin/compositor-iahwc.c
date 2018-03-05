@@ -867,9 +867,6 @@ static struct weston_plane *iahwc_output_prepare_overlay_view(
 
   buffer_resource = ev->surface->buffer_ref.buffer->resource;
   shmbuf = wl_shm_buffer_get(buffer_resource);
-  if (shmbuf) {
-      return NULL;
-  }
 
   if (!shmbuf) {
   if ((dmabuf = linux_dmabuf_buffer_get(buffer_resource))) {
