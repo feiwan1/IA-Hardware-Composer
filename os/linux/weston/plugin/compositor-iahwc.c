@@ -96,6 +96,7 @@ struct iahwc_backend {
   IAHWC_PFN_DISPLAY_CLEAR_ALL_LAYERS iahwc_display_clear_all_layers;
   IAHWC_PFN_PRESENT_DISPLAY iahwc_present_display;
   IAHWC_PFN_CREATE_LAYER iahwc_create_layer;
+  IAHWC_PFN_DESTROY_LAYER iahwc_destroy_layer;
   IAHWC_PFN_LAYER_SET_BO iahwc_layer_set_bo;
   IAHWC_PFN_LAYER_SET_RAW_PIXEL_DATA iahwc_layer_set_raw_pixel_data;
   IAHWC_PFN_LAYER_SET_SOURCE_CROP iahwc_layer_set_source_crop;
@@ -104,21 +105,14 @@ struct iahwc_backend {
   IAHWC_PFN_LAYER_SET_ACQUIRE_FENCE iahwc_layer_set_acquire_fence;
   IAHWC_PFN_LAYER_SET_USAGE iahwc_layer_set_usage;
 
-  int no_addfb2;
-
-  struct wl_list plane_list;
   int sprites_hidden;
 
   void *repaint_data;
-
-  bool universal_planes;
 
   struct udev_input input;
 
   int32_t cursor_width;
   int32_t cursor_height;
-
-  uint32_t pageflip_timeout;
 };
 
 struct iahwc_mode {
@@ -128,9 +122,7 @@ struct iahwc_mode {
 
 enum iahwc_fb_type {
   BUFFER_INVALID = 0, /**< never used */
-  BUFFER_CLIENT,      /**< directly sourced from client */
   BUFFER_GBM_SURFACE, /**< internal EGL rendering */
-  BUFFER_CURSOR,      /**< internal cursor buffer */
 };
 
 struct iahwc_fb {
@@ -169,6 +161,17 @@ struct iahwc_pending_state {
   struct iahwc_backend *backend;
 };
 
+struct iahwc_overlay {
+  struct wl_list link;
+
+  struct weston_plane base;
+
+  struct wl_shm_buffer *shm_memory;
+
+  struct gbm_bo *overlay_bo;
+  uint32_t overlay_layer_id;
+};
+
 struct iahwc_output {
   struct weston_output base;
   drmModeConnector *connector;
@@ -176,7 +179,7 @@ struct iahwc_output {
   uint32_t crtc_id; /* object ID to pass to IAHWC functions */
   int pipe;         /* index of CRTC in resource array / bitmasks */
   uint32_t connector_id;
-  drmModeCrtcPtr original_crtc;
+
   struct iahwc_edid edid;
 
   enum dpms_enum dpms;
@@ -189,20 +192,18 @@ struct iahwc_output {
   int destroy_pending;
   int disable_pending;
 
-  int64_t primary_layer_id;
-  int64_t cursor_layer_id;
+  uint32_t primary_layer_id;
 
   struct gbm_bo *bo;
 
   struct weston_plane cursor_plane;
   struct weston_plane d_plane;
   struct weston_view *cursor_view;
-  struct wl_shm *prev_cursor_mem;
-  bool using_gl_cursor;
+  struct wl_list overlay_list;
+  struct wl_list overlay_list_shm;
 
   struct gbm_surface *gbm_surface;
   uint32_t gbm_format;
-  struct gbm_bo *overlay_bo;
 
   /* Plane for a fullscreen direct scanout view */
   struct weston_plane scanout_plane;
@@ -223,6 +224,7 @@ struct iahwc_output {
 
   struct wl_event_source *pageflip_timer;
   int frame_commited;
+  int release_fence;
 };
 
 static struct gl_renderer_interface *gl_renderer;
@@ -247,8 +249,7 @@ static void iahwc_fb_destroy(struct iahwc_fb *fb) {
 static void iahwc_fb_destroy_gbm(struct gbm_bo *bo, void *data) {
   struct iahwc_fb *fb = data;
 
-  assert(fb->type == BUFFER_GBM_SURFACE || fb->type == BUFFER_CLIENT ||
-         fb->type == BUFFER_CURSOR);
+  assert(fb->type == BUFFER_GBM_SURFACE);
   iahwc_fb_destroy(fb);
 }
 
@@ -307,10 +308,6 @@ static void iahwc_fb_unref(struct iahwc_fb *fb) {
     return;
 
   switch (fb->type) {
-    case BUFFER_CURSOR:
-    case BUFFER_CLIENT:
-      gbm_bo_destroy(fb->bo);
-      break;
     case BUFFER_GBM_SURFACE:
       gbm_surface_release_buffer(fb->gbm_surface, fb->bo);
       break;
@@ -373,9 +370,8 @@ static struct iahwc_fb *iahwc_output_render_gl(struct iahwc_output *output,
 
   b->iahwc_layer_set_bo(b->iahwc_device, 0, output->primary_layer_id, bo);
 
-  // XXX/TODO: need to get the acquire fence and pass it instead of -1
   b->iahwc_layer_set_acquire_fence(b->iahwc_device, 0, output->primary_layer_id,
-                                   -1);
+				   -1);
 
   ret = iahwc_fb_get_from_bo(bo, b, output->gbm_format, BUFFER_GBM_SURFACE);
 
@@ -432,7 +428,7 @@ static int iahwc_output_repaint(struct weston_output *output_base,
                                 pixman_region32_t *damage, void *repaint_data) {
   struct iahwc_output *output = to_iahwc_output(output_base);
   struct iahwc_backend *backend = to_iahwc_backend(output->base.compositor);
-  int release_fence, ret;
+  struct iahwc_overlay* p = 0;
 
   if (output->disable_pending || output->destroy_pending)
     return -1;
@@ -453,40 +449,28 @@ static int iahwc_output_repaint(struct weston_output *output_base,
   if (!output->fb_pending)
     return -1;
 
-  if (output->prev_cursor_mem)
-	wl_shm_buffer_begin_access(output->prev_cursor_mem);
-
-  backend->iahwc_present_display(backend->iahwc_device, 0, &release_fence);
-  output->frame_commited = 1;
-
-  weston_log("release fence is %d\n", release_fence);
-  if (release_fence > 0) {
-    ret = sync_wait(release_fence, -1);
-    if (ret < 0)
-      weston_log("failed to wait on fence %d: %s\n", release_fence,
-                 strerror(errno));
+  weston_log("release fence is %d\n", output->release_fence);
+  if (output->release_fence > 0) {
+    close(output->release_fence);
+    output->release_fence = 0;
   }
 
-  close(release_fence);
+  wl_list_for_each(p, &output->overlay_list_shm, link) {
+      wl_shm_buffer_begin_access(p->shm_memory);
+  }
 
-  if (output->prev_cursor_mem)
-    wl_shm_buffer_end_access(output->prev_cursor_mem);
+
+  backend->iahwc_present_display(backend->iahwc_device, 0, &output->release_fence);
+  output->frame_commited = 1;
+
+  wl_list_for_each(p, &output->overlay_list_shm, link) {
+      wl_shm_buffer_end_access(p->shm_memory);
+  }
 
   output->fb_last = output->fb_current;
   output->fb_current = output->fb_pending;
   output->fb_pending = NULL;
-
-  uint32_t refresh = output_base->current_mode->refresh;
-
   return 0;
-
-  /* if (output->fb_pending) { */
-  /* 	iahwc_fb_unref(output->fb_pending); */
-  /* 	output->fb_pending = NULL; */
-  /* } */
-
-  /* return -1; */
-
 }
 
 static void iahwc_output_start_repaint_loop(struct weston_output *output_base) {
@@ -731,6 +715,56 @@ static int init_egl(struct iahwc_backend *b) {
   return 0;
 }
 
+/**
+ * Add Overlay information to the list managed by the output.
+ */
+static void iahwc_add_overlay_info(struct iahwc_output *output, struct wl_shm_buffer *shm_memory, struct gbm_bo *overlay_bo, uint32_t overlay_layer_id)
+{
+	struct iahwc_overlay *plane;
+
+	plane = zalloc(sizeof *plane);
+	if (!plane) {
+		weston_log("%s: out of memory\n", __func__);
+		return;
+	}
+
+	if (shm_memory) {
+	  plane->shm_memory = shm_memory;
+	  plane->overlay_bo = 0;
+	  wl_list_insert(&output->overlay_list_shm, &plane->link);
+	} else {
+	    plane->overlay_bo = overlay_bo;
+	    plane->shm_memory = 0;
+	  wl_list_insert(&output->overlay_list, &plane->link);
+	}
+
+	plane->overlay_layer_id = overlay_layer_id;
+}
+
+/**
+ * Clean up output overlay lists.
+ */
+static void
+iahwc_overlay_destroy(struct iahwc_output *output)
+{
+	struct iahwc_overlay *plane, *next;
+		struct iahwc_overlay *plane_shm, *next_shm;
+		  struct iahwc_backend *b = to_iahwc_backend(output->base.compositor);
+
+	wl_list_for_each_safe(plane_shm, next_shm, &output->overlay_list_shm, link) {
+	   b->iahwc_destroy_layer(b->iahwc_device, 0, plane_shm->overlay_layer_id);
+	    wl_list_remove(&plane_shm->link);
+	    free(plane_shm);
+	}
+
+	wl_list_for_each_safe(plane, next, &output->overlay_list, link) {
+	    b->iahwc_destroy_layer(b->iahwc_device, 0, plane_shm->overlay_layer_id);
+	    gbm_bo_destroy(plane->overlay_bo);
+	    wl_list_remove(&plane->link);
+	    free(plane);
+	}
+}
+
 static struct weston_plane *iahwc_output_prepare_cursor_view(
     struct iahwc_output *output, struct weston_view *ev) {
   struct iahwc_backend *b = to_iahwc_backend(output->base.compositor);
@@ -742,29 +776,26 @@ static struct weston_plane *iahwc_output_prepare_cursor_view(
   if (output->cursor_view)
     return NULL;
 
-  /* Don't import buffers which span multiple outputs. */
-  if (ev->output_mask != (1u << output->base.id))
-    return NULL;
-
-  /* We use GBM to import SHM buffers. */
-  if (b->gbm == NULL)
-    return NULL;
-
   if (ev->surface->buffer_ref.buffer == NULL)
     return NULL;
+
   shmbuf = wl_shm_buffer_get(ev->surface->buffer_ref.buffer->resource);
   if (!shmbuf)
     return NULL;
+
   if (wl_shm_buffer_get_format(shmbuf) != WL_SHM_FORMAT_ARGB8888)
     return NULL;
 
   if (output->base.transform != WL_OUTPUT_TRANSFORM_NORMAL)
     return NULL;
+
   if (ev->transform.enabled &&
       (ev->transform.matrix.type > WESTON_MATRIX_TRANSFORM_TRANSLATE))
     return NULL;
+
   if (viewport->buffer.scale != output->base.current_scale)
     return NULL;
+
   if (ev->geometry.scissor_enabled)
     return NULL;
 
@@ -776,17 +807,16 @@ static struct weston_plane *iahwc_output_prepare_cursor_view(
   weston_view_to_global_float(ev, 0, 0, &x, &y);
   output->cursor_plane.x = x;
   output->cursor_plane.y = y;
-  fprintf(stderr, "utput->cursor_layer_id %d \n", output->cursor_layer_id);
-  if (output->cursor_layer_id == -1) {
-    b->iahwc_create_layer(b->iahwc_device, 0, &output->cursor_layer_id);
-    b->iahwc_layer_set_usage(b->iahwc_device, 0, output->cursor_layer_id,
-                             IAHWC_LAYER_USAGE_CURSOR);
-  }
+  uint32_t cursor_layer_id = 0;
+    fprintf(stderr, "utput->cursor_layer_id %d \n", cursor_layer_id);
+  b->iahwc_create_layer(b->iahwc_device, 0, &cursor_layer_id);
+  b->iahwc_layer_set_usage(b->iahwc_device, 0, cursor_layer_id,
+			   IAHWC_LAYER_USAGE_CURSOR);
 
   int32_t surfwidth = ev->surface->width;
   int32_t surfheight = ev->surface->height;
 
-  output->prev_cursor_mem = buffer->shm_buffer;
+  iahwc_add_overlay_info(output, buffer->shm_buffer, 0, cursor_layer_id);
 
   struct iahwc_raw_pixel_data dbo;
   dbo.width = surfwidth;
@@ -795,7 +825,7 @@ static struct weston_plane *iahwc_output_prepare_cursor_view(
   dbo.format = DRM_FORMAT_ARGB8888;
   dbo.buffer = wl_shm_buffer_get_data(buffer->shm_buffer);
 
-  b->iahwc_layer_set_raw_pixel_data(b->iahwc_device, 0, output->cursor_layer_id,
+  b->iahwc_layer_set_raw_pixel_data(b->iahwc_device, 0, cursor_layer_id,
                                     dbo);
 
   iahwc_rect_t source_crop = {0, 0, surfwidth, surfheight};
@@ -806,11 +836,11 @@ static struct weston_plane *iahwc_output_prepare_cursor_view(
   damage_region.numRects = 1;
   damage_region.rects = &source_crop;
 
-  b->iahwc_layer_set_source_crop(b->iahwc_device, 0, output->cursor_layer_id,
+  b->iahwc_layer_set_source_crop(b->iahwc_device, 0, cursor_layer_id,
                                  source_crop);
-  b->iahwc_layer_set_display_frame(b->iahwc_device, 0, output->cursor_layer_id,
+  b->iahwc_layer_set_display_frame(b->iahwc_device, 0, cursor_layer_id,
                                    display_frame);
-  b->iahwc_layer_set_surface_damage(b->iahwc_device, 0, output->cursor_layer_id,
+  b->iahwc_layer_set_surface_damage(b->iahwc_device, 0, cursor_layer_id,
                                     damage_region);
 
   return &output->cursor_plane;
@@ -824,35 +854,28 @@ static struct weston_plane *iahwc_output_prepare_overlay_view(
   struct wl_resource *buffer_resource;
   struct weston_plane *p = &output->d_plane;
   struct linux_dmabuf_buffer *dmabuf;
-  int found = 0;
   struct gbm_bo *bo;
+    struct wl_shm_buffer *shmbuf;
   pixman_region32_t dest_rect, src_rect;
   pixman_box32_t *box, tbox;
-  uint32_t format;
   wl_fixed_t sx1, sy1, sx2, sy2;
   int32_t src_x, src_y;
   uint32_t src_w, src_h;
   uint32_t dest_x, dest_y;
   uint32_t dest_w, dest_h;
 
-  int64_t overlay_layer_id;
-
-  /* We can only import GBM buffers. */
-  if (b->gbm == NULL)
-    return NULL;
+  uint32_t overlay_layer_id;
 
   if (ev->surface->buffer_ref.buffer == NULL)
     return NULL;
   buffer_resource = ev->surface->buffer_ref.buffer->resource;
-  if (wl_shm_buffer_get(buffer_resource))
-    return NULL;
-  if (viewport->buffer.transform != output->base.transform)
-    return NULL;
-  if (viewport->buffer.scale != output->base.current_scale)
-    return NULL;
-  if (ev->alpha != 1.0f)
-    return NULL;
+  shmbuf = wl_shm_buffer_get(buffer_resource);
+  // FIXME: We should be able to handle this in HWC side.
+  if (shmbuf) {
+      return NULL;
+  }
 
+  if (!shmbuf) {
   if ((dmabuf = linux_dmabuf_buffer_get(buffer_resource))) {
 #ifdef HAVE_GBM_FD_IMPORT
     /* XXX: TODO:
@@ -895,6 +918,8 @@ static struct weston_plane *iahwc_output_prepare_overlay_view(
   if (!bo)
     return NULL;
 
+  }
+
   box = pixman_region32_extents(&ev->transform.boundingbox);
   p->x = box->x1;
   p->y = box->y1;
@@ -906,12 +931,12 @@ static struct weston_plane *iahwc_output_prepare_overlay_view(
    */
   pixman_region32_init(&dest_rect);
   pixman_region32_intersect(&dest_rect, &ev->transform.boundingbox,
-                            &output->base.region);
+			    &output->base.region);
   pixman_region32_translate(&dest_rect, -output->base.x, -output->base.y);
   box = pixman_region32_extents(&dest_rect);
   tbox = weston_transformed_rect(output->base.width, output->base.height,
-                                 output->base.transform,
-                                 output->base.current_scale, *box);
+				 output->base.transform,
+				 output->base.current_scale, *box);
   dest_x = tbox.x1;
   dest_y = tbox.y1;
   dest_w = tbox.x2 - tbox.x1;
@@ -920,13 +945,13 @@ static struct weston_plane *iahwc_output_prepare_overlay_view(
 
   pixman_region32_init(&src_rect);
   pixman_region32_intersect(&src_rect, &ev->transform.boundingbox,
-                            &output->base.region);
+			    &output->base.region);
   box = pixman_region32_extents(&src_rect);
 
   weston_view_from_global_fixed(ev, wl_fixed_from_int(box->x1),
-                                wl_fixed_from_int(box->y1), &sx1, &sy1);
+				wl_fixed_from_int(box->y1), &sx1, &sy1);
   weston_view_from_global_fixed(ev, wl_fixed_from_int(box->x2),
-                                wl_fixed_from_int(box->y2), &sx2, &sy2);
+				wl_fixed_from_int(box->y2), &sx2, &sy2);
 
   if (sx1 < 0)
     sx1 = 0;
@@ -943,9 +968,9 @@ static struct weston_plane *iahwc_output_prepare_overlay_view(
   tbox.y2 = sy2;
 
   tbox = weston_transformed_rect(wl_fixed_from_int(ev->surface->width),
-                                 wl_fixed_from_int(ev->surface->height),
-                                 viewport->buffer.transform,
-                                 viewport->buffer.scale, tbox);
+				 wl_fixed_from_int(ev->surface->height),
+				 viewport->buffer.transform,
+				 viewport->buffer.scale, tbox);
 
   src_x = tbox.x1 << 8;
   src_y = tbox.y1 << 8;
@@ -955,8 +980,23 @@ static struct weston_plane *iahwc_output_prepare_overlay_view(
 
   b->iahwc_create_layer(b->iahwc_device, 0, &overlay_layer_id);
   b->iahwc_layer_set_usage(b->iahwc_device, 0, overlay_layer_id,
-                           IAHWC_LAYER_USAGE_OVERLAY);
-  b->iahwc_layer_set_bo(b->iahwc_device, 0, overlay_layer_id, bo);
+			   IAHWC_LAYER_USAGE_OVERLAY);
+
+  if (shmbuf) {
+      iahwc_add_overlay_info(output, shmbuf, 0, overlay_layer_id);
+      struct iahwc_raw_pixel_data dbo;
+      dbo.width = ev->surface->width;
+      dbo.height = ev->surface->height;
+      dbo.stride = wl_shm_buffer_get_stride(shmbuf);
+      dbo.format = wl_shm_buffer_get_format(shmbuf);
+      dbo.buffer = wl_shm_buffer_get_data(shmbuf);
+      b->iahwc_layer_set_raw_pixel_data(b->iahwc_device, 0, overlay_layer_id,
+					dbo);
+  } else {
+    iahwc_add_overlay_info(output, 0, bo, overlay_layer_id);
+    b->iahwc_layer_set_bo(b->iahwc_device, 0, overlay_layer_id, bo);
+  }
+
   iahwc_rect_t source_crop = {src_x, src_y, src_w, src_h};
 
   iahwc_rect_t display_frame = {dest_x, dest_y, dest_w, dest_h};
@@ -971,8 +1011,6 @@ static struct weston_plane *iahwc_output_prepare_overlay_view(
                                    display_frame);
   b->iahwc_layer_set_surface_damage(b->iahwc_device, 0,
 				    overlay_layer_id, damage_region);
-
-  output->overlay_bo = bo;
   return p;
 }
 
@@ -1117,14 +1155,8 @@ static void iahwc_assign_planes(struct weston_output *output_base,
   output->cursor_plane.x = INT32_MIN;
   output->cursor_plane.y = INT32_MIN;
 
-  //b->iahwc_display_clear_all_layers(b->iahwc_device, 0);
-  //output->cursor_layer_id = -1;
-  //output->primary_layer_id = -1;
-  // TODO: FIXME
-  /*if (output->overlay_bo) {
-    gbm_bo_destroy(output->overlay_bo);
-    output->overlay_bo = NULL;
-  }*/
+  // Clean up our bookkeeping of all overlays.
+  iahwc_overlay_destroy(output);
 
   wl_list_for_each_safe(ev, next, &output_base->compositor->view_list, link) {
     struct weston_surface *es = ev->surface;
@@ -1153,10 +1185,13 @@ static void iahwc_assign_planes(struct weston_output *output_base,
 
     if (pixman_region32_not_empty(&surface_overlap))
       next_plane = primary;
+
     if (next_plane == NULL)
       next_plane = iahwc_output_prepare_cursor_view(output, ev);
+
     if (next_plane == NULL)
       next_plane = iahwc_output_prepare_overlay_view(output, ev);
+
     if (next_plane == NULL)
       next_plane = primary;
 
@@ -1378,7 +1413,6 @@ err:
 
 static void iahwc_output_deinit(struct weston_output *base) {
   struct iahwc_output *output = to_iahwc_output(base);
-  struct iahwc_backend *b = to_iahwc_backend(base->compositor);
 
   /* output->fb_last and output->fb_pending must not be set here;
    * destroy_pending/disable_pending exist to guarantee exactly this. */
@@ -1431,12 +1465,16 @@ static int iahwc_output_disable(struct weston_output *base) {
 static int vsync_callback(iahwc_callback_data_t data, iahwc_display_t display,
                           int64_t timestamp) {
   struct iahwc_output *output = data;
+  uint32_t flags = WP_PRESENTATION_FEEDBACK_KIND_HW_COMPLETION |
+		   WP_PRESENTATION_FEEDBACK_KIND_HW_CLOCK;
   struct timespec ts;
   ts.tv_nsec = timestamp;
   ts.tv_sec = timestamp / (1000 * 1000 * 1000);
 
   if (output->pageflip_timer && output->frame_commited)
     wl_event_source_timer_update(output->pageflip_timer, 1);
+
+  //weston_output_finish_frame(&output->base, &ts, flags);
 
   output->frame_commited = 0;
 
@@ -1510,9 +1548,10 @@ static int create_output_for_connector(struct iahwc_backend *b) {
 
   output->base.connection_internal = true;
 
-  output->cursor_layer_id = -1;
   output->primary_layer_id = -1;
-  output->using_gl_cursor = false;
+  wl_list_init(&output->overlay_list);
+  wl_list_init(&output->overlay_list_shm);
+
 
   b->iahwc_get_display_configs(b->iahwc_device, 0, &num_configs, NULL);
   configs = (uint32_t *)calloc(num_configs, sizeof(uint32_t));
@@ -1682,6 +1721,8 @@ static struct iahwc_backend *iahwc_backend_create(
           iahwc_device, IAHWC_FUNC_GET_NUM_DISPLAYS);
   b->iahwc_create_layer = (IAHWC_PFN_CREATE_LAYER)iahwc_device->getFunctionPtr(
       iahwc_device, IAHWC_FUNC_CREATE_LAYER);
+  b->iahwc_destroy_layer = (IAHWC_PFN_DESTROY_LAYER)iahwc_device->getFunctionPtr(
+	      iahwc_device, IAHWC_FUNC_DESTROY_LAYER);
   b->iahwc_get_display_info =
       (IAHWC_PFN_DISPLAY_GET_INFO)iahwc_device->getFunctionPtr(
           iahwc_device, IAHWC_FUNC_DISPLAY_GET_INFO);
@@ -1782,8 +1823,6 @@ static struct iahwc_backend *iahwc_backend_create(
   b->base.repaint_begin = iahwc_repaint_begin;
   b->base.repaint_flush = iahwc_repaint_flush;
   b->base.repaint_cancel = iahwc_repaint_cancel;
-
-  wl_list_init(&b->plane_list);
 
   // XXX/TODO: No sprites for now
   // XXX/TODO: Add api in hwc to get plane info.
