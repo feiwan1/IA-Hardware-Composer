@@ -455,17 +455,9 @@ static int iahwc_output_repaint(struct weston_output *output_base,
     output->release_fence = 0;
   }
 
-  wl_list_for_each(p, &output->overlay_list_shm, link) {
-      wl_shm_buffer_begin_access(p->shm_memory);
-  }
-
 
   backend->iahwc_present_display(backend->iahwc_device, 0, &output->release_fence);
   output->frame_commited = 1;
-
-  wl_list_for_each(p, &output->overlay_list_shm, link) {
-      wl_shm_buffer_end_access(p->shm_memory);
-  }
 
   output->fb_last = output->fb_current;
   output->fb_current = output->fb_pending;
@@ -824,9 +816,10 @@ static struct weston_plane *iahwc_output_prepare_cursor_view(
   dbo.stride = wl_shm_buffer_get_stride(buffer->shm_buffer);
   dbo.format = DRM_FORMAT_ARGB8888;
   dbo.buffer = wl_shm_buffer_get_data(buffer->shm_buffer);
-
+  wl_shm_buffer_begin_access(buffer->shm_buffer);
   b->iahwc_layer_set_raw_pixel_data(b->iahwc_device, 0, cursor_layer_id,
                                     dbo);
+    wl_shm_buffer_end_access(buffer->shm_buffer);
 
   iahwc_rect_t source_crop = {0, 0, surfwidth, surfheight};
 
@@ -842,6 +835,9 @@ static struct weston_plane *iahwc_output_prepare_cursor_view(
                                    display_frame);
   b->iahwc_layer_set_surface_damage(b->iahwc_device, 0, cursor_layer_id,
                                     damage_region);
+
+  struct weston_surface *es = ev->surface;
+  es->keep_buffer = true;
 
   return &output->cursor_plane;
 }
@@ -868,9 +864,9 @@ static struct weston_plane *iahwc_output_prepare_overlay_view(
 
   if (ev->surface->buffer_ref.buffer == NULL)
     return NULL;
+
   buffer_resource = ev->surface->buffer_ref.buffer->resource;
   shmbuf = wl_shm_buffer_get(buffer_resource);
-  // FIXME: We should be able to handle this in HWC side.
   if (shmbuf) {
       return NULL;
   }
@@ -990,8 +986,10 @@ static struct weston_plane *iahwc_output_prepare_overlay_view(
       dbo.stride = wl_shm_buffer_get_stride(shmbuf);
       dbo.format = wl_shm_buffer_get_format(shmbuf);
       dbo.buffer = wl_shm_buffer_get_data(shmbuf);
+	    wl_shm_buffer_begin_access(shmbuf);
       b->iahwc_layer_set_raw_pixel_data(b->iahwc_device, 0, overlay_layer_id,
 					dbo);
+	wl_shm_buffer_end_access(shmbuf);
   } else {
     iahwc_add_overlay_info(output, 0, bo, overlay_layer_id);
     b->iahwc_layer_set_bo(b->iahwc_device, 0, overlay_layer_id, bo);
@@ -1011,6 +1009,10 @@ static struct weston_plane *iahwc_output_prepare_overlay_view(
                                    display_frame);
   b->iahwc_layer_set_surface_damage(b->iahwc_device, 0,
 				    overlay_layer_id, damage_region);
+
+  struct weston_surface *es = ev->surface;
+  es->keep_buffer = true;
+
   return p;
 }
 
@@ -1159,32 +1161,12 @@ static void iahwc_assign_planes(struct weston_output *output_base,
   iahwc_overlay_destroy(output);
 
   wl_list_for_each_safe(ev, next, &output_base->compositor->view_list, link) {
-    struct weston_surface *es = ev->surface;
-    pixman_box32_t *box = pixman_region32_extents(&ev->transform.boundingbox);
-    /* Test whether this buffer can ever go into a plane:
-     * non-shm, or small enough to be a cursor.
-     *
-     * Also, keep a reference when using the pixman renderer.
-     * That makes it possible to do a seamless switch to the GL
-     * renderer and since the pixman renderer keeps a reference
-     * to the buffer anyway, there is no side effects.
-     */
-    if (es->buffer_ref.buffer &&
-         (!wl_shm_buffer_get(es->buffer_ref.buffer->resource) ||
-          (ev->surface->width <= b->cursor_width &&
-	   ev->surface->height <= b->cursor_height)))
-      es->keep_buffer = true;
-    else
-      es->keep_buffer = false;
 
     pixman_region32_init(&surface_overlap);
     pixman_region32_intersect(&surface_overlap, &overlap,
                               &ev->transform.boundingbox);
 
     next_plane = NULL;
-
-    if (pixman_region32_not_empty(&surface_overlap))
-      next_plane = primary;
 
     if (next_plane == NULL)
       next_plane = iahwc_output_prepare_cursor_view(output, ev);
@@ -1198,6 +1180,9 @@ static void iahwc_assign_planes(struct weston_output *output_base,
     weston_view_move_to_plane(ev, next_plane);
 
     if (next_plane == primary) {
+	struct weston_surface *es = ev->surface;
+	es->keep_buffer = false;
+
       if (output->primary_layer_id == -1) {
         b->iahwc_create_layer(b->iahwc_device, 0, &output->primary_layer_id);
       }
@@ -1218,16 +1203,7 @@ static void iahwc_assign_planes(struct weston_output *output_base,
       pixman_region32_union(&overlap, &overlap, &ev->transform.boundingbox);
     }
 
-    if (next_plane == primary || next_plane == &output->cursor_plane) {
-      /* cursor plane involves a copy */
-      ev->psf_flags = 0;
-    } else {
-      /* All other planes are a direct scanout of a
-       * single client buffer.
-       */
-      ev->psf_flags = WP_PRESENTATION_FEEDBACK_KIND_ZERO_COPY;
-    }
-
+    ev->psf_flags = WP_PRESENTATION_FEEDBACK_KIND_ZERO_COPY;
     pixman_region32_fini(&surface_overlap);
   }
   pixman_region32_fini(&overlap);
