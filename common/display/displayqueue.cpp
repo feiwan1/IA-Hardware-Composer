@@ -145,7 +145,6 @@ void DisplayQueue::GetCachedLayers(const std::vector<OverlayLayer>& layers,
   // If Scanout layers DisplayFrame rect has changed, we need
   // to re-calculate our Composition regions for planes using
   // GPU Composition.
-  bool reset_composition_regions = false;
   bool reset_plane = remove_index != -1 ? true : false;
   bool removed_layers = false;
   bool plane_free = false;
@@ -267,7 +266,7 @@ void DisplayQueue::GetCachedLayers(const std::vector<OverlayLayer>& layers,
     if (target_plane.NeedsOffScreenComposition()) {
       HwcRect<int> surface_damage = HwcRect<int>(0, 0, 0, 0);
       bool update_rect = reset_plane;
-      bool refresh_surfaces = reset_composition_regions;
+      bool refresh_surfaces = false;
       bool force_partial_clear = false;
 
       const std::vector<size_t>& source_layers = target_plane.GetSourceLayers();
@@ -279,10 +278,6 @@ void DisplayQueue::GetCachedLayers(const std::vector<OverlayLayer>& layers,
           if (layer.HasDimensionsChanged() || layer.HasSourceRectChanged()) {
             update_rect = true;
             break;
-          }
-
-          if (refresh_surfaces) {
-            continue;
           }
 
           if (layer.NeedsPartialClear()) {
@@ -379,10 +374,7 @@ void DisplayQueue::GetCachedLayers(const std::vector<OverlayLayer>& layers,
 
       if (!needs_gpu_composition)
         needs_gpu_composition = !(squashed_plane.IsSurfaceRecycled());
-
-      reset_composition_regions = false;
     } else {
-      reset_composition_regions = false;
       const OverlayLayer* layer =
           &(layers.at(last_plane.GetSourceLayers().front()));
 
@@ -397,8 +389,6 @@ void DisplayQueue::GetCachedLayers(const std::vector<OverlayLayer>& layers,
           *can_ignore_commit = false;
           return;
         }
-
-        reset_composition_regions = true;
       }
 
       last_plane.SetOverlayLayer(layer);
@@ -409,7 +399,6 @@ void DisplayQueue::GetCachedLayers(const std::vector<OverlayLayer>& layers,
       bool needs_revalidation = layer->NeedsRevalidation();
       if (layer->HasDimensionsChanged() || needs_revalidation) {
         ignore_commit = false;
-        reset_composition_regions = true;
       }
 
       if (needs_revalidation) {

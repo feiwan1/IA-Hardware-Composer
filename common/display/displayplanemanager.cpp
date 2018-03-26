@@ -916,7 +916,6 @@ bool DisplayPlaneManager::ReValidatePlanes(
   // Let's first check the current combination works.
   *request_full_validation = false;
   bool render = false;
-  bool reset_composition_region = false;
   std::vector<OverlayPlane> commit_planes;
   for (DisplayPlaneState &temp : composition) {
     commit_planes.emplace_back(
@@ -950,15 +949,9 @@ bool DisplayPlaneManager::ReValidatePlanes(
   for (DisplayPlaneState &last_plane : composition) {
     if (!last_plane.NeedsOffScreenComposition()) {
       index++;
-      reset_composition_region = false;
       continue;
     }
 
-    if (reset_composition_region) {
-      last_plane.RefreshSurfaces(NativeSurface::kFullClear, true);
-    }
-
-    reset_composition_region = false;
     uint32_t revalidation_type = last_plane.RevalidationType();
 
     if (!revalidation_type) {
@@ -999,7 +992,6 @@ bool DisplayPlaneManager::ReValidatePlanes(
 #endif
         MarkSurfacesForRecycling(&last_plane, mark_later, true);
         last_plane.SetOverlayLayer(layer);
-        reset_composition_region = true;
       }
     }
 
