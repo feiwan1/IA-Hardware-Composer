@@ -177,7 +177,6 @@ bool Gralloc1BufferHandler::ReleaseBuffer(HWCNativeHandle handle) const {
   if (handle->hwc_buffer_) {
     release_(gralloc1_dvc, handle->handle_);
   } else if (handle->imported_handle_) {
-    ReleaseGraphicsBuffer(handle, fd_);
     release_(gralloc1_dvc, handle->imported_handle_);
   }
 

@@ -67,6 +67,23 @@ VkFormat NativeToVkFormat(int native_format) {
 }
 #endif
 
-int ReleaseFrameBuffer(uint32_t gpu_fd, uint32_t fd) {
-  return drmModeRmFB(gpu_fd, fd);
+int ReleaseFrameBuffer(const FBKey& key, uint32_t fd) {
+  return drmModeRmFB(key.gpu_fd_, fd);
+}
+
+int CreateFrameBuffer(const FBKey& key, uint32_t* fb_id) {
+  int ret = drmModeAddFB2(key.gpu_fd_, key.width_, key.height_,
+                          key.frame_buffer_format_, key.gem_handles_,
+                          key.pitches_, key.offsets_, fb_id, 0);
+
+  if (ret) {
+    ETRACE("drmModeAddFB2 error (%dx%d, %c%c%c%c, handle %d pitch %d) (%s)",
+           key.width_, key.height_, key.frame_buffer_format_,
+           key.frame_buffer_format_ >> 8, key.frame_buffer_format_ >> 16,
+           key.frame_buffer_format_ >> 24, key.gem_handles_[0], key.pitches_[0],
+           strerror(-ret));
+    fb_id = 0;
+  }
+
+  return ret;
 }

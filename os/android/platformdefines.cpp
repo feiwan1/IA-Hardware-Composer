@@ -67,6 +67,54 @@ VkFormat NativeToVkFormat(int native_format) {
 }
 #endif
 
-int ReleaseFrameBuffer(uint32_t gpu_fd, uint32_t fd) {
-  return drmModeRmFB(gpu_fd, fd);
+int ReleaseFrameBuffer(const FBKey& key, uint32_t fd) {
+  int ret = 0;
+
+  uint32_t total_planes = key.num_planes_;
+  struct drm_gem_close gem_close;
+  int last_gem_handle = -1;
+
+  for (uint32_t plane = 0; plane < total_planes; plane++) {
+    uint32_t current_gem_handle = key.gem_handles_[plane];
+    if ((last_gem_handle != -1) &&
+        (current_gem_handle == static_cast<uint32_t>(last_gem_handle))) {
+      break;
+    }
+
+    memset(&gem_close, 0, sizeof(gem_close));
+    last_gem_handle = current_gem_handle;
+    gem_close.handle = current_gem_handle;
+
+    ret = drmIoctl(fd, DRM_IOCTL_GEM_CLOSE, &gem_close);
+    if (ret) {
+      ETRACE(
+          "Failed to close gem handle ErrorCode: %d PrimeFD: %d "
+          "GemHandle: %d  \n",
+          ret, fd, current_gem_handle);
+    }
+  }
+
+  ret = drmModeRmFB(key.gpu_fd_, fd);
+  if (ret) {
+    ETRACE("Failed to Remove FD ErrorCode: %d FD: %d \n", ret, fd);
+  }
+
+  return ret;
+}
+
+int CreateFrameBuffer(const FBKey& key, uint32_t* fb_id) {
+  int ret = drmModeAddFB2(key.gpu_fd_, key.width_, key.height_,
+                          key.frame_buffer_format_, key.gem_handles_,
+                          key.pitches_, key.offsets_, fb_id, 0);
+
+  if (ret) {
+    ETRACE("drmModeAddFB2 error (%dx%d, %c%c%c%c, handle %d pitch %d) (%s)",
+           key.width_, key.height_, key.frame_buffer_format_,
+           key.frame_buffer_format_ >> 8, key.frame_buffer_format_ >> 16,
+           key.frame_buffer_format_ >> 24, key.gem_handles_[0], key.pitches_[0],
+           strerror(-ret));
+    fb_id = 0;
+  }
+
+  return ret;
 }
